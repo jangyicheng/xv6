@@ -13,7 +13,6 @@
 // * Only one process at a time can use a buffer,
 //     so do not keep them longer than necessary.
 
-
 #include "types.h"
 #include "param.h"
 #include "spinlock.h"
@@ -23,79 +22,143 @@
 #include "fs.h"
 #include "buf.h"
 
-struct {
-  struct spinlock lock;
+#define NBUCKETS 13
+struct
+{
+  struct spinlock lock[NBUCKETS];
   struct buf buf[NBUF];
-
   // Linked list of all buffers, through prev/next.
-  // Sorted by how recently the buffer was used.
-  // head.next is most recent, head.prev is least.
-  struct buf head;
+  // head.next is most recently used.
+  // struct buf head;
+  struct buf hashbucket[NBUCKETS]; // 每个哈希队列一个linked list及一个lock
 } bcache;
 
-void
-binit(void)
+struct spinlock global_lock;
+
+int hash(uint blockno)
+{
+  return blockno % NBUCKETS;
+}
+
+char bname[NBUCKETS][12];
+void binit(void)
 {
   struct buf *b;
 
-  initlock(&bcache.lock, "bcache");
-
   // Create linked list of buffers
-  bcache.head.prev = &bcache.head;
-  bcache.head.next = &bcache.head;
-  for(b = bcache.buf; b < bcache.buf+NBUF; b++){
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
+  for (int i = 0; i < NBUCKETS; i++)
+  {
+    snprintf(bname[i], sizeof(bname[i]), "bcache-%d", i);
+    initlock(&bcache.lock[i], bname[i]);
+
+    bcache.hashbucket[i].prev = &bcache.hashbucket[i];
+    bcache.hashbucket[i].next = &bcache.hashbucket[i];
+  } // 初始化bcache
+
+  int bucket;
+  for (int i = 0; i < NBUF; i++)
+  {
+    b = &bcache.buf[i];
+    bucket = hash(b->blockno);
+    b->next = bcache.hashbucket[bucket].next;
+    b->prev = &bcache.hashbucket[bucket];
     initsleeplock(&b->lock, "buffer");
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    bcache.hashbucket[bucket].next->prev = b;
+    bcache.hashbucket[bucket].next = b;
   }
 }
-
 // Look through buffer cache for block on device dev.
 // If not found, allocate a buffer.
 // In either case, return locked buffer.
-static struct buf*
+static struct buf *
 bget(uint dev, uint blockno)
 {
   struct buf *b;
 
-  acquire(&bcache.lock);
+  int bucket = hash(blockno);
+  acquire(&bcache.lock[bucket]);
 
   // Is the block already cached?
-  for(b = bcache.head.next; b != &bcache.head; b = b->next){
-    if(b->dev == dev && b->blockno == blockno){
+  // 在当前桶内搜索buffer
+  for (b = bcache.hashbucket[bucket].next; b != &bcache.hashbucket[bucket]; b = b->next)
+  {
+    if (b->dev == dev && b->blockno == blockno)
+    {
       b->refcnt++;
-      release(&bcache.lock);
+      release(&bcache.lock[bucket]);
       acquiresleep(&b->lock);
       return b;
     }
   }
 
-  // Not cached.
-  // Recycle the least recently used (LRU) unused buffer.
-  for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
-    if(b->refcnt == 0) {
+  for (b = bcache.hashbucket[bucket].prev; b != &bcache.hashbucket[bucket]; b = b->prev)
+  {
+    if (b->refcnt == 0) // 找到一个空闲的buffer
+    {
       b->dev = dev;
       b->blockno = blockno;
       b->valid = 0;
       b->refcnt = 1;
-      release(&bcache.lock);
+      release(&bcache.lock[bucket]);
       acquiresleep(&b->lock);
       return b;
     }
   }
+  release(&bcache.lock[bucket]);
+  // Not cached.
+  // Recycle the least recently used (LRU) unused buffer.
+  // 在其他桶内搜索buffer
+
+  acquire(&global_lock);
+  for (int i = 1; i < NBUCKETS; i++)
+  {
+    int id = (i + bucket) % NBUCKETS;
+    acquire(&bcache.lock[id]);
+    for (b = bcache.hashbucket[id].prev; b != &bcache.hashbucket[id]; b = b->prev)
+    {
+
+      if (b->refcnt == 0) // 偷取到一个空闲的buffer
+      {
+        b->dev = dev;
+        b->blockno = blockno;
+        b->valid = 0;
+        b->refcnt = 1;
+        //先移除
+        b->next->prev = b->prev;
+        b->prev->next = b->next;
+
+        //再加入
+        acquire(&bcache.lock[bucket]);
+        b->next = bcache.hashbucket[bucket].next;
+        b->prev = &bcache.hashbucket[bucket];
+
+        bcache.hashbucket[bucket].next->prev = b;
+        bcache.hashbucket[bucket].next = b;
+
+        release(&bcache.lock[bucket]);
+        release(&bcache.lock[id]);
+        release(&global_lock);
+
+        acquiresleep(&b->lock);
+        return b;
+      }
+    }
+    release(&bcache.lock[id]);
+  }
+
+
   panic("bget: no buffers");
 }
 
 // Return a locked buf with the contents of the indicated block.
-struct buf*
+struct buf *
 bread(uint dev, uint blockno)
 {
   struct buf *b;
 
   b = bget(dev, blockno);
-  if(!b->valid) {
+  if (!b->valid)
+  {
     virtio_disk_rw(b, 0);
     b->valid = 1;
   }
@@ -103,51 +166,52 @@ bread(uint dev, uint blockno)
 }
 
 // Write b's contents to disk.  Must be locked.
-void
-bwrite(struct buf *b)
+void bwrite(struct buf *b)
 {
-  if(!holdingsleep(&b->lock))
+  if (!holdingsleep(&b->lock))
     panic("bwrite");
   virtio_disk_rw(b, 1);
 }
 
 // Release a locked buffer.
 // Move to the head of the most-recently-used list.
-void
-brelse(struct buf *b)
+void brelse(struct buf *b)
 {
-  if(!holdingsleep(&b->lock))
+  if (!holdingsleep(&b->lock))
     panic("brelse");
 
   releasesleep(&b->lock);
 
-  acquire(&bcache.lock);
+  int bucket = hash(b->blockno);
+  acquire(&bcache.lock[bucket]); // 打算释放对应的buffer，首先获取对应桶的锁
   b->refcnt--;
-  if (b->refcnt == 0) {
+
+  if (b->refcnt == 0)
+  {
     // no one is waiting for it.
     b->next->prev = b->prev;
     b->prev->next = b->next;
-    b->next = bcache.head.next;
-    b->prev = &bcache.head;
-    bcache.head.next->prev = b;
-    bcache.head.next = b;
+    b->next = bcache.hashbucket[bucket].next;
+    b->prev = &bcache.hashbucket[bucket];
+    bcache.hashbucket[bucket].next->prev = b;
+    bcache.hashbucket[bucket].next = b;
   }
-  
-  release(&bcache.lock);
+
+  release(&bcache.lock[bucket]);
 }
 
-void
-bpin(struct buf *b) {
-  acquire(&bcache.lock);
+void bpin(struct buf *b)
+{
+  int bucket = hash(b->blockno);
+  acquire(&bcache.lock[bucket]);
   b->refcnt++;
-  release(&bcache.lock);
+  release(&bcache.lock[bucket]);
 }
 
-void
-bunpin(struct buf *b) {
-  acquire(&bcache.lock);
+void bunpin(struct buf *b)
+{
+  int bucket = hash(b->blockno);
+  acquire(&bcache.lock[bucket]);
   b->refcnt--;
-  release(&bcache.lock);
+  release(&bcache.lock[bucket]);
 }
-
-
