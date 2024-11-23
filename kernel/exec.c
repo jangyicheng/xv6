@@ -32,7 +32,7 @@ int exec(char *path, char **argv) {
   if (elf.magic != ELF_MAGIC) goto bad;
 
   if ((pagetable = proc_pagetable(p)) == 0) goto bad;
-
+ 
   // Load program into memory.
   for (i = 0, off = elf.phoff; i < elf.phnum; i++, off += sizeof(ph)) {
     if (readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph)) goto bad;
@@ -97,6 +97,8 @@ int exec(char *path, char **argv) {
   p->trapframe->sp = sp;          // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
 
+  if(p->pid==1) vmprint(p->pagetable);
+  sync_pagetable(p->pagetable,p->k_pagetable);
   return argc;  // this ends up in a0, the first argument to main(argc, argv)
 
 bad:
@@ -105,6 +107,7 @@ bad:
     iunlockput(ip);
     end_op();
   }
+  sync_pagetable(p->pagetable,p->k_pagetable);
   return -1;
 }
 

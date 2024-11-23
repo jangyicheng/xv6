@@ -36,7 +36,10 @@ void procinit(void) {
     if (pa == 0) panic("kalloc");
     uint64 va = KSTACK((int)(p - proc));
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+
     p->kstack = va;
+    p->kstack_pa = (uint64)pa; 
+
   }
   kvminithart();
 }
@@ -111,6 +114,19 @@ found:
     return 0;
   }
 
+  //内核页表映射
+  p->k_pagetable = my_kvminit();
+  if (p->k_pagetable == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  uint64 va = p->kstack;
+  uint64 pa = p->kstack_pa;
+  //映射PCB新增的成员
+  my_kvmmap(p->k_pagetable, va, pa, PGSIZE, PTE_R | PTE_W);
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -120,6 +136,21 @@ found:
   return p;
 }
 
+void myproc_freepagetable(pagetable_t pagetable){
+  // there are 2^9 = 512 PTEs in a page table.
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) && (pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // this PTE points to a lower-level page table.
+      uint64 child = PTE2PA(pte);
+      myproc_freepagetable((pagetable_t)child);
+      pagetable[i] = 0;
+    } else if (pte & PTE_V) {
+      pagetable[i] = 0;
+    }
+  }
+  kfree((void *)pagetable);
+}
 // free a proc structure and the data hanging from it,
 // including user pages.
 // p->lock must be held.
@@ -136,7 +167,17 @@ static void freeproc(struct proc *p) {
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+
+  pagetable_t pa = (pagetable_t)PTE2PA(p->k_pagetable[0]);
+  for (int i = 0; i < 96; i++) {
+    pa[i] = 0;
+  }
+
+  if(p->k_pagetable)myproc_freepagetable(p->k_pagetable);
+  // if (p->kstack) p->kstack = 0;
+  p->k_pagetable =0;
 }
+
 
 // Create a user page table for a given process,
 // with no user memory, but with trampoline pages.
@@ -202,6 +243,7 @@ void userinit(void) {
 
   p->state = RUNNABLE;
 
+  sync_pagetable(p->pagetable,p->k_pagetable);
   release(&p->lock);
 }
 
@@ -220,6 +262,7 @@ int growproc(int n) {
     sz = uvmdealloc(p->pagetable, sz, sz + n);
   }
   p->sz = sz;
+  sync_pagetable(p->pagetable,p->k_pagetable);
   return 0;
 }
 
@@ -261,6 +304,7 @@ int fork(void) {
   pid = np->pid;
 
   np->state = RUNNABLE;
+  sync_pagetable(np->pagetable,np->k_pagetable);
 
   release(&np->lock);
 
@@ -430,7 +474,11 @@ void scheduler(void) {
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

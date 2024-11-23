@@ -46,6 +46,8 @@ w_mepc(uint64 x)
 #define SSTATUS_SIE (1L << 1)  // Supervisor Interrupt Enable
 #define SSTATUS_UIE (1L << 0)  // User Interrupt Enable
 
+#define SSTATUS_SUM (1L << 18)  //这是我的宏定义
+
 static inline uint64
 r_sstatus()
 {
