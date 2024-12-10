@@ -172,6 +172,11 @@ int             copyout(pagetable_t, uint64, char *, uint64);
 int             copyin(pagetable_t, char *, uint64, uint64);
 int             copyinstr(pagetable_t, char *, uint64, uint64);
 
+
+void            add_pagecount(void *pa);
+int             cowalloc(pagetable_t pagetable, uint64 va);
+int             check_cow(uint64 va);
+
 // plic.c
 void            plicinit(void);
 void            plicinithart(void);

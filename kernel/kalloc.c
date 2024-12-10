@@ -21,12 +21,20 @@ struct run {
 struct {
   struct spinlock lock;
   struct run *freelist;
+  struct spinlock cowlock;
 } kmem;
+
+
+
+int pagecount[(PHYSTOP / PGSIZE)];
+// 引用计数
+#define PAGE_COUNT(p) pagecount[(uint64)(p) / PGSIZE]
 
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+    initlock(&kmem.cowlock, "cow");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -50,6 +58,11 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  PAGE_COUNT(pa)--; // 页面持有数-1
+    // 当页面持有数不为0，则直接返回
+  if (PAGE_COUNT(pa) > 0)
+    return;
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -76,7 +89,19 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r){
     memset((char*)r, 5, PGSIZE); // fill with junk
+    PAGE_COUNT(r) = 1;            // 将该物理页的引用次数初始化为1
+    // acquire(&kmem.lock);
+    // release(&kmem.lock);
+  }
   return (void*)r;
+}
+
+void
+add_pagecount(void *pa)
+{
+  acquire(&kmem.cowlock);
+  PAGE_COUNT(pa)++;
+  release(&kmem.cowlock);
 }

@@ -5,6 +5,7 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -311,7 +312,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
+  //char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
@@ -320,13 +321,22 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
       panic("uvmcopy: page not present");
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
+
+
+    // 将父进程的物理页映射到子进程页表项中
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
       goto err;
     }
+
+    // 物理页引用次数加一
+    add_pagecount((void*)pa);
+    // if((mem = kalloc()) == 0)
+    //   goto err;
+    // memmove(mem, (char*)pa, PGSIZE);
+    // if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+    //   kfree(mem);
+    //   goto err;
+    // }
   }
   return 0;
 
@@ -358,6 +368,11 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);
+
+    if(check_cow(dstva)){
+      if(cowalloc(pagetable,va0) != 0)
+        return -1;
+    }
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0)
       return -1;
@@ -439,4 +454,59 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+
+int 
+check_cow(uint64 va) {
+  pte_t *pte;
+  struct proc *p = myproc();
+  if(va >= MAXVA) 
+    return 0;
+  return va < p->sz                           
+    && ((pte = walk(p->pagetable, va, 0))!=0)   
+    && (*pte & PTE_COW)                           // 写时复制
+    && (*pte & PTE_V);                        // 有效
+}
+
+
+int cowalloc(pagetable_t pgtbl, uint64 va) {
+  pte_t *pte;
+  uint64 flags, old_pa, new_pa, page_start;
+
+  // 通过页表获取虚拟地址对应的页表项
+  pte = walk(pgtbl, va, 0);
+  if (pte == 0) {
+    return -1;
+  }
+
+  // 获取当前页表项的权限标志和物理地址
+  flags = PTE_FLAGS(*pte);
+  old_pa = PTE2PA(*pte);
+
+  // 分配新的内存页
+  new_pa = (uint64)kalloc();
+  if (!new_pa) {
+    return -1;
+  }
+
+  // 计算当前虚拟地址的页帧起始地址
+  page_start = PGROUNDDOWN(va);
+
+  // 更新权限标志：清除 PTE_COW 标记并设置可写
+  flags = (flags & ~PTE_COW) | PTE_W;
+
+  // 将父进程页帧的数据复制到新页
+  memmove((void *)new_pa, (void *)old_pa, PGSIZE);
+
+  // 取消对父进程页帧的映射
+  uvmunmap(pgtbl, page_start, 1, 1);
+
+  // 建立新的映射
+  if (mappages(pgtbl, page_start, 1, new_pa, flags) < 0) {
+    kfree((void *)new_pa);
+    return -1;
+  }
+
+  return 0;
 }
