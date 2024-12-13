@@ -56,7 +56,7 @@ binit(void)
 // If not found, allocate a buffer.
 // In either case, return locked buffer.
 static struct buf*
-bget(uint dev, uint blockno)
+bget(uint dev, uint blockno)//bget 是一个辅助函数，用于获取一个与指定设备和块编号相对应的缓冲区（struct buf）
 {
   struct buf *b;
 
